@@ -1,4 +1,4 @@
-/**
+f/**
  * TGJU → Google Sheets (Standalone Project) — ESM (Option A)
  * - No changes needed to your WP plugin
  * - Fetches https://call2.tgju.org/ajax.json
@@ -30,7 +30,7 @@ const WORKSHEET_TITLE = process.env.WORKSHEET_TITLE || "Rates";
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000);
 const ONLY_MAJOR = String(process.env.ONLY_MAJOR || "0") === "1";
 
-const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 || "";
+const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 
 // -----------------------------
 // Config: major fiat list only
@@ -224,13 +224,13 @@ function normalizeEntry(priceKey, item, group) {
 // -----------------------------
 function loadServiceAccountFromEnv() {
   if (!SA_B64) {
-    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 in env");
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON in env");
   }
   let jsonText = "";
   try {
     jsonText = Buffer.from(SA_B64, "base64").toString("utf8");
   } catch {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is not valid base64");
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid base64");
   }
 
   let creds;
