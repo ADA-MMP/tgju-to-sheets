@@ -1,18 +1,24 @@
 /**
- * TGJU → Google Sheets (Standalone Project)
+ * TGJU → Google Sheets (Standalone Project) — ESM (Option A)
  * - No changes needed to your WP plugin
  * - Fetches https://call2.tgju.org/ajax.json
  * - Writes rows into a defined Google Sheet tab
- * - Optional: ONLY_MAJOR=1 to keep only major currencies
+ * - Optional: ONLY_MAJOR=1 to keep only major fiat currencies
+ *
+ * Env required:
+ *  PORT
+ *  SHEET_ID
+ *  WORKSHEET_TITLE
+ *  GOOGLE_SERVICE_ACCOUNT_JSON_BASE64   (base64 of the service account JSON)
+ * Optional:
+ *  CACHE_TTL_MS
+ *  ONLY_MAJOR
  */
 
-"use strict";
-
-require("dotenv").config();
-
-const express = require("express");
-const cron = require("node-cron");
-const { GoogleSpreadsheet } = require("google-spreadsheet");
+import "dotenv/config";
+import express from "express";
+import cron from "node-cron";
+import { GoogleSpreadsheet } from "google-spreadsheet";
 
 const app = express();
 
@@ -24,12 +30,10 @@ const WORKSHEET_TITLE = process.env.WORKSHEET_TITLE || "Rates";
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000);
 const ONLY_MAJOR = String(process.env.ONLY_MAJOR || "0") === "1";
 
-// Load service account JSON (put file next to server.js)
-const GOOGLE_CREDS = require("./service-account.json");
+const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 || "";
 
 // -----------------------------
-// Config: major currencies only
-// (Edit this list anytime)
+// Config: major fiat list only
 // -----------------------------
 const MAJOR_FIAT = new Set([
   "usd", "eur", "gbp", "cad", "aed", "try",
@@ -49,7 +53,7 @@ const SPECIAL_CODE_MAP = {
   eur_ex: "eur_official",
 };
 
-// Persian names (expand as you like)
+// Persian names (expand any time)
 const FA_NAME_MAP = {
   usd: "دلار آمریکا",
   eur: "یورو",
@@ -130,7 +134,9 @@ function tgjuKeyToCode(priceKey) {
   return SPECIAL_CODE_MAP[raw] || raw;
 }
 
-// Very simple classification (matches your earlier logic)
+// -----------------------------
+// Classification rules
+// -----------------------------
 const CRYPTO_KEYWORDS = [
   "btc","eth","usdt","tether","xrp","trx","ltc","bch","bnb","ada",
   "doge","dot","sol","matic","shib","avax","atom","link","xlm","eos",
@@ -169,7 +175,7 @@ function isFiatKey(key) {
   return true;
 }
 
-// Normalize TGJU entry -> row object
+// Normalize TGJU entry -> row object (label/name NEVER numeric)
 function normalizeEntry(priceKey, item, group) {
   const code = tgjuKeyToCode(priceKey);
   const base = baseCurrency(code);
@@ -216,21 +222,45 @@ function normalizeEntry(priceKey, item, group) {
 // -----------------------------
 // Google Sheets write
 // -----------------------------
+function loadServiceAccountFromEnv() {
+  if (!SA_B64) {
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 in env");
+  }
+  let jsonText = "";
+  try {
+    jsonText = Buffer.from(SA_B64, "base64").toString("utf8");
+  } catch {
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is not valid base64");
+  }
+
+  let creds;
+  try {
+    creds = JSON.parse(jsonText);
+  } catch {
+    throw new Error("Decoded service account JSON is invalid");
+  }
+
+  if (!creds.client_email || !creds.private_key) {
+    throw new Error("Service account JSON missing client_email/private_key");
+  }
+  return creds;
+}
+
 async function getSheet() {
-  if (!SHEET_ID) throw new Error("Missing SHEET_ID in .env");
+  if (!SHEET_ID) throw new Error("Missing SHEET_ID in env");
+
+  const creds = loadServiceAccountFromEnv();
 
   const doc = new GoogleSpreadsheet(SHEET_ID);
 
   await doc.useServiceAccountAuth({
-    client_email: GOOGLE_CREDS.client_email,
-    private_key: GOOGLE_CREDS.private_key.replace(/\\n/g, "\n"),
+    client_email: creds.client_email,
+    private_key: String(creds.private_key).replace(/\\n/g, "\n"),
   });
 
   await doc.loadInfo();
 
-  const sheet =
-    doc.sheetsByTitle[WORKSHEET_TITLE] || doc.sheetsByIndex[0];
-
+  const sheet = doc.sheetsByTitle[WORKSHEET_TITLE] || doc.sheetsByIndex[0];
   if (!sheet) throw new Error("Worksheet not found");
 
   return sheet;
@@ -239,17 +269,21 @@ async function getSheet() {
 async function writeRowsToSheet(rows) {
   const sheet = await getSheet();
 
-  // Ensure headers exist
-  await sheet.loadHeaderRow().catch(() => {});
   const wantedHeaders = [
     "group","code","name_fa","price","change","low","high","ts","updated_at"
   ];
 
+  // Ensure headers
+  try {
+    await sheet.loadHeaderRow();
+  } catch {
+    // ignore
+  }
   if (!sheet.headerValues || sheet.headerValues.length === 0) {
     await sheet.setHeaderRow(wantedHeaders);
   }
 
-  // Clear old rows (keeps header)
+  // Delete old rows (keeps header)
   const existing = await sheet.getRows();
   if (existing.length) {
     await Promise.all(existing.map((r) => r.delete()));
@@ -266,12 +300,12 @@ async function writeRowsToSheet(rows) {
 }
 
 // -----------------------------
-// Fetch + build rows
-// -----------------------------
+// Fetch + build rows (with cache)
+/// -----------------------------
 let lastRun = { ok: false, error: "Not run yet", updated_at: null, count: 0 };
 let lastFetchMs = 0;
 
-async function fetchTGJU(force = false) {
+async function fetchAndWrite(force = false) {
   const age = nowMs() - lastFetchMs;
   if (!force && lastRun.ok && age < CACHE_TTL_MS) return lastRun;
 
@@ -284,11 +318,16 @@ async function fetchTGJU(force = false) {
   });
 
   const text = await res.text();
-  const json = JSON.parse(text);
-  const current = json?.current;
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error("TGJU response is not valid JSON");
+  }
 
+  const current = json?.current;
   if (!current || typeof current !== "object") {
-    throw new Error("TGJU JSON missing 'current'");
+    throw new Error("TGJU JSON missing 'current' object");
   }
 
   const rows = [];
@@ -315,25 +354,31 @@ async function fetchTGJU(force = false) {
     }
   }
 
-  // Sort for nicer sheet
+  // Sort for nicer output
   rows.sort((a, b) => (a.group + a.code).localeCompare(b.group + b.code));
 
   const result = await writeRowsToSheet(rows);
 
   lastRun = { ok: true, error: null, updated_at: result.updated_at, count: result.count };
   lastFetchMs = nowMs();
+
   return lastRun;
 }
 
 // -----------------------------
 // Routes
 // -----------------------------
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("tgju-to-sheets running ✅");
+});
+
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "tgju-to-sheets",
     lastRun,
     only_major: ONLY_MAJOR,
+    worksheet: WORKSHEET_TITLE,
   });
 });
 
@@ -341,7 +386,7 @@ app.get("/health", (_req, res) => {
 app.get("/run", async (req, res) => {
   const force = req.query.force === "1" || req.query.force === "true";
   try {
-    const out = await fetchTGJU(force);
+    const out = await fetchAndWrite(force);
     res.json({ ok: true, ...out });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || "unknown" });
@@ -353,7 +398,7 @@ app.get("/run", async (req, res) => {
 // -----------------------------
 cron.schedule("*/5 * * * *", async () => {
   try {
-    await fetchTGJU(false);
+    await fetchAndWrite(false);
     console.log("✅ Sheet updated:", lastRun);
   } catch (e) {
     console.error("❌ Update failed:", e?.message || e);
@@ -363,6 +408,6 @@ cron.schedule("*/5 * * * *", async () => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`tgju-to-sheets running on http://localhost:${PORT}`);
+  console.log(`tgju-to-sheets running on port ${PORT}`);
   console.log(`Manual run: /run?force=1`);
 });
