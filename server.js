@@ -1,19 +1,22 @@
 /**
- * TGJU → Google Sheets (Standalone Project) — ESM
- * - Fetches https://call2.tgju.org/ajax.json
- * - Writes rows into a defined Google Sheet tab
- * - label/name are NEVER numeric
- * - Optional: ONLY_MAJOR=1 to keep only major fiat currencies
+ * service.js — TGJU → Google Sheets (Render-ready, ESM)
  *
- * REQUIRED ENV:
- *  PORT
- *  SHEET_ID
- *  WORKSHEET_TITLE
- *  GOOGLE_SERVICE_ACCOUNT_JSON_BASE64   (base64 of the service-account JSON)
+ * Fixes:
+ * - Uses google-auth-library JWT (so NO doc.useServiceAccountAuth error)
+ * - Always ensures header row exists (so NO "Header values are not yet loaded")
  *
- * OPTIONAL ENV:
- *  CACHE_TTL_MS
- *  ONLY_MAJOR
+ * ENV required (Render → Environment Variables):
+ *   SHEET_ID
+ *   GOOGLE_SERVICE_ACCOUNT_JSON_BASE64
+ * Optional:
+ *   PORT
+ *   WORKSHEET_TITLE
+ *   CACHE_TTL_MS
+ *   ONLY_MAJOR   ("1" or "0")
+ *
+ * Routes:
+ *   GET /health
+ *   GET /run?force=1
  */
 
 import "dotenv/config";
@@ -55,7 +58,7 @@ const SPECIAL_CODE_MAP = {
   eur_ex: "eur_official",
 };
 
-// Persian names (major list; expand anytime)
+// Persian names (expand any time)
 const FA_NAME_MAP = {
   usd: "دلار آمریکا",
   eur: "یورو",
@@ -177,7 +180,7 @@ function isFiatKey(key) {
   return true;
 }
 
-// Normalize TGJU entry -> row object (name NEVER numeric)
+// Normalize TGJU entry -> row object (name/label NEVER numeric)
 function normalizeEntry(priceKey, item, group) {
   const code = tgjuKeyToCode(priceKey);
   const base = baseCurrency(code);
@@ -221,7 +224,7 @@ function normalizeEntry(priceKey, item, group) {
 }
 
 // -----------------------------
-// Google Sheets (JWT auth) ✅
+// Google Sheets auth + write
 // -----------------------------
 function loadServiceAccountFromEnv() {
   if (!SA_B64) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 in env");
@@ -246,20 +249,21 @@ function loadServiceAccountFromEnv() {
   return creds;
 }
 
+function makeJwtAuth(creds) {
+  return new JWT({
+    email: creds.client_email,
+    key: String(creds.private_key).replace(/\\n/g, "\n"),
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+}
+
 async function getSheet() {
   if (!SHEET_ID) throw new Error("Missing SHEET_ID in env");
 
   const creds = loadServiceAccountFromEnv();
+  const auth = makeJwtAuth(creds);
 
-  const auth = new JWT({
-    email: creds.client_email,
-    key: String(creds.private_key).replace(/\\n/g, "\n"),
-    scopes: [
-      "https://www.googleapis.com/auth/spreadsheets",
-      "https://www.googleapis.com/auth/drive.file",
-    ],
-  });
-
+  // v4+ supports passing auth in constructor
   const doc = new GoogleSpreadsheet(SHEET_ID, auth);
 
   await doc.loadInfo();
@@ -270,24 +274,43 @@ async function getSheet() {
   return sheet;
 }
 
+async function ensureHeaders(sheet, wantedHeaders) {
+  // Try load; may fail if not set yet
+  try {
+    await sheet.loadHeaderRow();
+  } catch {
+    // ignore
+  }
+
+  const hasHeaders =
+    Array.isArray(sheet.headerValues) && sheet.headerValues.length > 0;
+
+  if (!hasHeaders) {
+    await sheet.setHeaderRow(wantedHeaders);
+    await sheet.loadHeaderRow(); // IMPORTANT: now headerValues exists
+  }
+}
+
 async function writeRowsToSheet(rows) {
   const sheet = await getSheet();
 
   const wantedHeaders = [
-    "group","code","name_fa","price","change","low","high","ts","updated_at"
+    "group",
+    "code",
+    "name_fa",
+    "price",
+    "change",
+    "low",
+    "high",
+    "ts",
+    "updated_at",
   ];
 
-  // Ensure headers
-  try { await sheet.loadHeaderRow(); } catch {}
-  if (!sheet.headerValues || sheet.headerValues.length === 0) {
-    await sheet.setHeaderRow(wantedHeaders);
-  }
+  await ensureHeaders(sheet, wantedHeaders);
 
-  // Clear old rows (keeps header)
+  // Clear old rows
   const existing = await sheet.getRows();
-  if (existing.length) {
-    await Promise.all(existing.map((r) => r.delete()));
-  }
+  for (const r of existing) await r.delete();
 
   const updated_at = new Date().toISOString();
   const finalRows = rows.map((r) => ({ ...r, updated_at }));
@@ -318,6 +341,7 @@ async function fetchAndWrite(force = false) {
   });
 
   const text = await res.text();
+
   let json;
   try {
     json = JSON.parse(text);
@@ -354,14 +378,12 @@ async function fetchAndWrite(force = false) {
     }
   }
 
-  // Sort for nicer output
   rows.sort((a, b) => (a.group + a.code).localeCompare(b.group + b.code));
 
   const result = await writeRowsToSheet(rows);
 
   lastRun = { ok: true, error: null, updated_at: result.updated_at, count: result.count };
   lastFetchMs = nowMs();
-
   return lastRun;
 }
 
@@ -382,7 +404,6 @@ app.get("/health", (_req, res) => {
   });
 });
 
-// Manual trigger
 app.get("/run", async (req, res) => {
   const force = req.query.force === "1" || req.query.force === "true";
   try {
@@ -406,8 +427,10 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
+// -----------------------------
 // Start server
+// -----------------------------
 app.listen(PORT, () => {
-  console.log(`tgju-to-sheets running on http://localhost:${PORT}`);
+  console.log(`tgju-to-sheets running on port ${PORT}`);
   console.log(`Manual run: /run?force=1`);
 });
