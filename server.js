@@ -295,31 +295,70 @@ async function writeRowsToSheet(rows) {
   const sheet = await getSheet();
 
   const wantedHeaders = [
-    "group",
-    "code",
-    "name_fa",
-    "price",
-    "change",
-    "low",
-    "high",
-    "ts",
-    "updated_at",
+    "group","code","name_fa","price","change","low","high","ts","updated_at"
   ];
 
-  await ensureHeaders(sheet, wantedHeaders);
-
-  // Clear old rows
-  const existing = await sheet.getRows();
-  for (const r of existing) await r.delete();
-
-  const updated_at = new Date().toISOString();
-  const finalRows = rows.map((r) => ({ ...r, updated_at }));
-
-  if (finalRows.length) {
-    await sheet.addRows(finalRows);
+  // 1) Ensure headers exist and are loaded
+  try {
+    await sheet.loadHeaderRow();
+  } catch {}
+  if (!sheet.headerValues || sheet.headerValues.length === 0) {
+    await sheet.setHeaderRow(wantedHeaders);
+    await sheet.loadHeaderRow(); // IMPORTANT: load again after setting
   }
 
-  return { count: finalRows.length, updated_at };
+  // 2) Load existing rows and map them by unique key: group|code
+  const existingRows = await sheet.getRows();
+  const map = new Map();
+  for (const r of existingRows) {
+    const g = String(r.group || "").trim();
+    const c = String(r.code || "").trim().toLowerCase();
+    if (g && c) map.set(`${g}|${c}`, r);
+  }
+
+  const updated_at = new Date().toISOString();
+  let updated = 0;
+  let added = 0;
+
+  // 3) Update existing rows (keeps row position), add missing ones
+  for (const item of rows) {
+    const g = String(item.group || "").trim();
+    const c = String(item.code || "").trim().toLowerCase();
+    if (!g || !c) continue;
+
+    const key = `${g}|${c}`;
+    const row = map.get(key);
+
+    if (row) {
+      // UPDATE in place (row number stays the same)
+      row.name_fa = item.name_fa ?? "";
+      row.price = item.price ?? "";
+      row.change = item.change ?? "";
+      row.low = item.low ?? "";
+      row.high = item.high ?? "";
+      row.ts = item.ts ?? "";
+      row.updated_at = updated_at;
+
+      await row.save();
+      updated++;
+    } else {
+      // ADD new row (only happens once for a new currency)
+      await sheet.addRow({
+        group: g,
+        code: c,
+        name_fa: item.name_fa ?? "",
+        price: item.price ?? "",
+        change: item.change ?? "",
+        low: item.low ?? "",
+        high: item.high ?? "",
+        ts: item.ts ?? "",
+        updated_at,
+      });
+      added++;
+    }
+  }
+
+  return { count: rows.length, updated, added, updated_at };
 }
 
 // -----------------------------
