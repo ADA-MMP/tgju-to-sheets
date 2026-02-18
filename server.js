@@ -291,6 +291,7 @@ async function ensureHeaders(sheet, wantedHeaders) {
   }
 }
 
+
 async function writeRowsToSheet(rows) {
   const sheet = await getSheet();
 
@@ -305,17 +306,17 @@ async function writeRowsToSheet(rows) {
     await sheet.loadHeaderRow();
   }
 
-  // Load existing rows and index by (group|code|name_fa)
+  // Index existing rows by (group|code)
   const existingRows = await sheet.getRows();
   const map = new Map();
   for (const r of existingRows) {
     const g = String(r.group || "").trim();
     const c = String(r.code || "").trim().toLowerCase();
-    const n = String(r.name_fa || "").trim();
-    if (!g || !c || !n) continue;
+    if (!g || !c) continue;
 
-    // First match wins (keeps an old row "fixed")
-    const key = `${g}|${c}|${n}`;
+    const key = `${g}|${c}`;
+
+    // keep the first row as the "fixed" one
     if (!map.has(key)) map.set(key, r);
   }
 
@@ -326,15 +327,14 @@ async function writeRowsToSheet(rows) {
   for (const item of rows) {
     const g = String(item.group || "").trim();
     const c = String(item.code || "").trim().toLowerCase();
-    const n = String(item.name_fa || "").trim();
+    if (!g || !c) continue;
 
-    if (!g || !c || !n) continue;
-
-    const key = `${g}|${c}|${n}`;
+    const key = `${g}|${c}`;
     const row = map.get(key);
 
     if (row) {
-      // ✅ Update in place ONLY if group+code+name_fa match exactly
+      // ✅ Update in place (row stays fixed) by group+code
+      row.name_fa = String(item.name_fa || "").trim();   // can change
       row.price = item.price ?? "";
       row.change = item.change ?? "";
       row.low = item.low ?? "";
@@ -345,11 +345,11 @@ async function writeRowsToSheet(rows) {
       await row.save();
       updated++;
     } else {
-      // ✅ Otherwise add a NEW row
+      // ✅ New currency -> new fixed row
       await sheet.addRow({
         group: g,
         code: c,
-        name_fa: n,
+        name_fa: String(item.name_fa || "").trim(),
         price: item.price ?? "",
         change: item.change ?? "",
         low: item.low ?? "",
@@ -363,7 +363,6 @@ async function writeRowsToSheet(rows) {
 
   return { count: rows.length, updated, added, updated_at };
 }
-
 
 // -----------------------------
 // Fetch + build rows (with cache)
