@@ -1,30 +1,39 @@
 /**
- * service.js — TGJU → Google Sheets (Standalone Project) — ESM (Option A)
- * ✅ Updates rows IN PLACE by (group + code) so row stays fixed over time
- * ✅ Adds new row only for new currencies
- * ✅ One-time safety: deduplicates existing duplicates by (group + code)
+ * service.js — TGJU → Google Sheets (ESM, Option A, Render-friendly)
  *
- * Env required:
- *  PORT
- *  SHEET_ID
- *  WORKSHEET_TITLE
- *  GOOGLE_SERVICE_ACCOUNT_JSON_BASE64   (base64 of the service account JSON)
- * Optional:
- *  CACHE_TTL_MS
- *  ONLY_MAJOR   (1 = keep only MAJOR_FIAT list for fiat group)
+ * Fixes your error:
+ *   "doc.useServiceAccountAuth is not a function"
+ * by using google-auth-library JWT and passing it into GoogleSpreadsheet(...)
+ *
+ * Key requirement:
+ *   Keep rows “fixed” by (group + code):
+ *   - If a row with same group+code exists -> UPDATE it in place
+ *   - If not -> ADD a new row
+ *
+ * ENV (Render > Environment Variables):
+ *   SHEET_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ *   WORKSHEET_TITLE=Rates
+ *   GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=base64(JSON)
+ *   ONLY_MAJOR=0|1
+ *   CACHE_TTL_MS=60000
+ *   PORT=3000  (Render sets PORT automatically; you can omit)
+ *
+ * NPM deps needed:
+ *   express, dotenv, node-cron, google-spreadsheet, google-auth-library
  */
 
 import "dotenv/config";
 import express from "express";
 import cron from "node-cron";
 import { GoogleSpreadsheet } from "google-spreadsheet";
+import { JWT } from "google-auth-library";
 
 const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
 const TGJU_JSON_URL = "https://call2.tgju.org/ajax.json";
 
-const SHEET_ID = process.env.SHEET_ID;
+const SHEET_ID = process.env.SHEET_ID || "";
 const WORKSHEET_TITLE = process.env.WORKSHEET_TITLE || "Rates";
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000);
 const ONLY_MAJOR = String(process.env.ONLY_MAJOR || "0") === "1";
@@ -32,7 +41,7 @@ const ONLY_MAJOR = String(process.env.ONLY_MAJOR || "0") === "1";
 const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 || "";
 
 // -----------------------------
-// Config: major fiat list only
+// Major fiat only (optional)
 // -----------------------------
 const MAJOR_FIAT = new Set([
   "usd", "eur", "gbp", "cad", "aed", "try",
@@ -43,7 +52,7 @@ const MAJOR_FIAT = new Set([
   "php", "mxn", "brl", "zar",
 ]);
 
-// TGJU special fiat keys -> normalized codes
+// TGJU special keys -> normalized codes
 const SPECIAL_CODE_MAP = {
   dollar_rl: "usd",
   dollar_ex: "usd_official",
@@ -52,7 +61,7 @@ const SPECIAL_CODE_MAP = {
   eur_ex: "eur_official",
 };
 
-// Persian names (expand any time)
+// Persian names (extend anytime)
 const FA_NAME_MAP = {
   usd: "دلار آمریکا",
   eur: "یورو",
@@ -143,8 +152,8 @@ const CRYPTO_KEYWORDS = [
 ];
 
 const GOLD_KEYWORDS = [
-  "gold","silver","xau","sekke","rob","nim","gerami","emami","bahar",
-  "mesghal","ons","coin","tala","sime","abshode",
+  "gold","silver","xau","sekke","sekee","sekeb","rob","nim","gerami",
+  "emami","bahar","mesghal","ons","coin","tala","sime","abshode",
 ];
 
 function isGoldKey(key) {
@@ -154,6 +163,7 @@ function isGoldKey(key) {
 
 function isCryptoKey(key) {
   const k = key.toLowerCase();
+
   if (k.endsWith("-irr") || k.endsWith("_irr")) {
     return CRYPTO_KEYWORDS.some((c) => k.startsWith(c));
   }
@@ -174,7 +184,9 @@ function isFiatKey(key) {
   return true;
 }
 
-// Normalize TGJU entry -> row object (name NEVER numeric)
+// -----------------------------
+// Normalize TGJU entry -> sheet row
+// -----------------------------
 function normalizeEntry(priceKey, item, group) {
   const code = tgjuKeyToCode(priceKey);
   const base = baseCurrency(code);
@@ -199,6 +211,7 @@ function normalizeEntry(priceKey, item, group) {
     safeString(item?.s) ||
     "";
 
+  // NEVER allow numeric “name/label”
   const safeRawName = isNumericLike(rawName) ? "" : rawName.trim();
   const safeRawLabel = isNumericLike(rawLabel) ? "" : rawLabel.trim();
 
@@ -207,7 +220,7 @@ function normalizeEntry(priceKey, item, group) {
 
   return {
     group,
-    code: String(code).toLowerCase(),
+    code,
     name_fa,
     price,
     change: safeString(item?.diff) || safeString(item?.change) || "0",
@@ -218,7 +231,7 @@ function normalizeEntry(priceKey, item, group) {
 }
 
 // -----------------------------
-// Google auth + sheet
+// Google auth + sheet helpers
 // -----------------------------
 function loadServiceAccountFromEnv() {
   if (!SA_B64) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 in env");
@@ -243,143 +256,124 @@ function loadServiceAccountFromEnv() {
   return creds;
 }
 
-async function getSheetDoc() {
+async function getWorksheet() {
   if (!SHEET_ID) throw new Error("Missing SHEET_ID in env");
 
   const creds = loadServiceAccountFromEnv();
-  const doc = new GoogleSpreadsheet(SHEET_ID);
-
-  // google-spreadsheet v4 expects this
-  await doc.useServiceAccountAuth({
-    client_email: creds.client_email,
-    private_key: String(creds.private_key).replace(/\\n/g, "\n"),
+  const jwt = new JWT({
+    email: creds.client_email,
+    key: String(creds.private_key).replace(/\\n/g, "\n"),
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 
-  await doc.loadInfo();
-  return doc;
-}
+  // ✅ v4+ uses auth in constructor
+  const doc = new GoogleSpreadsheet(SHEET_ID, jwt);
 
-async function getSheet() {
-  const doc = await getSheetDoc();
+  await doc.loadInfo();
+
   const sheet = doc.sheetsByTitle[WORKSHEET_TITLE] || doc.sheetsByIndex[0];
   if (!sheet) throw new Error("Worksheet not found");
+
   return sheet;
 }
 
-async function ensureHeaderRow(sheet) {
-  const wantedHeaders = ["group","code","name_fa","price","change","low","high","ts","updated_at"];
+async function ensureHeaders(sheet) {
+  const wanted = ["group","code","name_fa","price","change","low","high","ts","updated_at"];
 
-  // IMPORTANT: loadHeaderRow may throw if no header exists yet
-  let hasHeader = false;
-  try {
-    await sheet.loadHeaderRow();
-    hasHeader = Array.isArray(sheet.headerValues) && sheet.headerValues.length > 0;
-  } catch {
-    hasHeader = false;
-  }
-
-  if (!hasHeader) {
-    await sheet.setHeaderRow(wantedHeaders);
-  }
-
-  // Ensure headerValues are loaded for safe access later
+  // Important: load header row first (fixes "Header values are not yet loaded")
   try {
     await sheet.loadHeaderRow();
   } catch {
-    // ignore
+    // If sheet is brand-new, loadHeaderRow may fail; ignore.
   }
 
-  return wantedHeaders;
-}
+  const current = Array.isArray(sheet.headerValues) ? sheet.headerValues : [];
 
-// One-time cleanup: remove duplicates by (group|code), keep the first row
-async function dedupeSheetByGroupCode(sheet) {
-  const rows = await sheet.getRows();
-  const seen = new Map();
-  let removed = 0;
-
-  for (const r of rows) {
-    const g = String(r.group || "").trim();
-    const c = String(r.code || "").trim().toLowerCase();
-    if (!g || !c) continue;
-
-    const key = `${g}|${c}`;
-    if (seen.has(key)) {
-      await r.delete();
-      removed++;
-    } else {
-      seen.set(key, r);
-    }
+  if (!current.length) {
+    await sheet.setHeaderRow(wanted);
+    return wanted;
   }
 
-  if (removed > 0) console.log(`🧹 Removed ${removed} duplicate rows`);
+  // If headers differ, set to wanted (optional but safer)
+  const same =
+    current.length === wanted.length &&
+    current.every((h, i) => String(h) === String(wanted[i]));
+
+  if (!same) {
+    await sheet.setHeaderRow(wanted);
+    return wanted;
+  }
+
+  return current;
 }
 
-// Update-in-place by (group+code). Add new rows only if missing.
-async function upsertRowsByGroupCode(sheet, incomingRows) {
-  const existingRows = await sheet.getRows();
+/**
+ * Upsert by group+code:
+ * - Update existing row in place
+ * - Add new row if not found
+ * (Does NOT delete rows that disappeared from TGJU.)
+ */
+async function upsertRows(sheet, incomingRows) {
+  await ensureHeaders(sheet);
 
-  // Build map: group|code -> row
-  const map = new Map();
-  for (const r of existingRows) {
-    const g = String(r.group || "").trim();
-    const c = String(r.code || "").trim().toLowerCase();
+  const existing = await sheet.getRows(); // reads all rows
+  const byKey = new Map();
+
+  for (const r of existing) {
+    const g = String(r.get("group") ?? "").trim().toLowerCase();
+    const c = String(r.get("code") ?? "").trim().toLowerCase();
     if (!g || !c) continue;
-    map.set(`${g}|${c}`, r);
+    byKey.set(`${g}|${c}`, r);
   }
 
   const updated_at = new Date().toISOString();
   let updated = 0;
-  let inserted = 0;
+  const toInsert = [];
 
-  for (const it of incomingRows) {
-    const g = String(it.group || "").trim();
-    const c = String(it.code || "").trim().toLowerCase();
-    if (!g || !c) continue;
-
+  for (const row of incomingRows) {
+    const g = String(row.group).toLowerCase();
+    const c = String(row.code).toLowerCase();
     const key = `${g}|${c}`;
-    const found = map.get(key);
 
+    const found = byKey.get(key);
     if (found) {
-      // update existing
-      found.name_fa = it.name_fa;
-      found.price = it.price ?? "";
-      found.change = it.change ?? "";
-      found.low = it.low ?? "";
-      found.high = it.high ?? "";
-      found.ts = it.ts ?? "";
-      found.updated_at = updated_at;
+      // update in place
+      found.set("name_fa", row.name_fa);
+      found.set("price", row.price);
+      found.set("change", row.change);
+      found.set("low", row.low);
+      found.set("high", row.high);
+      found.set("ts", row.ts);
+      found.set("updated_at", updated_at);
 
       await found.save();
       updated++;
     } else {
       // insert new
-      await sheet.addRow({
-        group: g,
-        code: c,
-        name_fa: it.name_fa,
-        price: it.price ?? "",
-        change: it.change ?? "",
-        low: it.low ?? "",
-        high: it.high ?? "",
-        ts: it.ts ?? "",
+      toInsert.push({
+        ...row,
         updated_at,
       });
-      inserted++;
     }
   }
 
-  return { updated_at, updated, inserted, total: incomingRows.length };
+  let inserted = 0;
+  if (toInsert.length) {
+    await sheet.addRows(toInsert);
+    inserted = toInsert.length;
+  }
+
+  return { updated, inserted, updated_at, total_incoming: incomingRows.length };
 }
 
 // -----------------------------
-// Fetch + write (with cache)
+// Fetch TGJU -> build incoming rows
 // -----------------------------
 let lastRun = {
   ok: false,
   error: "Not run yet",
   updated_at: null,
-  count: 0,
+  total_incoming: 0,
   updated: 0,
   inserted: 0,
 };
@@ -410,7 +404,7 @@ async function fetchAndWrite(force = false) {
     throw new Error("TGJU JSON missing 'current' object");
   }
 
-  const incoming = [];
+  const rows = [];
 
   for (const key of Object.keys(current)) {
     if (!key.startsWith("price_")) continue;
@@ -419,39 +413,27 @@ async function fetchAndWrite(force = false) {
     const k = key.toLowerCase();
 
     if (isGoldKey(k)) {
-      incoming.push(normalizeEntry(key, item, "gold"));
+      rows.push(normalizeEntry(key, item, "gold"));
       continue;
     }
     if (isCryptoKey(k)) {
-      incoming.push(normalizeEntry(key, item, "crypto"));
+      rows.push(normalizeEntry(key, item, "crypto"));
       continue;
     }
     if (isFiatKey(k)) {
       const entry = normalizeEntry(key, item, "fiat");
       if (ONLY_MAJOR && !MAJOR_FIAT.has(baseCurrency(entry.code))) continue;
-      incoming.push(entry);
-      continue;
+      rows.push(entry);
     }
   }
 
-  // stable order in memory (doesn't affect sheet row positions)
-  incoming.sort((a, b) => (a.group + a.code).localeCompare(b.group + b.code));
+  // Stable sort (doesn’t affect row “fixedness”; key is group+code)
+  rows.sort((a, b) => (a.group + "|" + a.code).localeCompare(b.group + "|" + b.code));
 
-  // sheet operations
-  const sheet = await getSheet();
-  await ensureHeaderRow(sheet);
-  await dedupeSheetByGroupCode(sheet);
+  const sheet = await getWorksheet();
+  const result = await upsertRows(sheet, rows);
 
-  const result = await upsertRowsByGroupCode(sheet, incoming);
-
-  lastRun = {
-    ok: true,
-    error: null,
-    updated_at: result.updated_at,
-    count: result.total,
-    updated: result.updated,
-    inserted: result.inserted,
-  };
+  lastRun = { ok: true, error: null, ...result };
   lastFetchMs = nowMs();
 
   return lastRun;
@@ -468,19 +450,20 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "tgju-to-sheets",
-    lastRun,
-    only_major: ONLY_MAJOR,
     worksheet: WORKSHEET_TITLE,
+    only_major: ONLY_MAJOR,
+    cache_ttl_ms: CACHE_TTL_MS,
+    lastRun,
   });
 });
 
-// Manual trigger
 app.get("/run", async (req, res) => {
   const force = req.query.force === "1" || req.query.force === "true";
   try {
     const out = await fetchAndWrite(force);
     res.json({ ok: true, ...out });
   } catch (e) {
+    lastRun = { ok: false, error: e?.message || "unknown", updated_at: null, total_incoming: 0, updated: 0, inserted: 0 };
     res.status(500).json({ ok: false, error: e?.message || "unknown" });
   }
 });
@@ -491,22 +474,15 @@ app.get("/run", async (req, res) => {
 cron.schedule("*/5 * * * *", async () => {
   try {
     await fetchAndWrite(false);
-    console.log("✅ Sheet updated:", lastRun);
+    console.log("✅ Sheet upsert OK:", lastRun);
   } catch (e) {
-    console.error("❌ Update failed:", e?.message || e);
-    lastRun = {
-      ok: false,
-      error: e?.message || "unknown",
-      updated_at: null,
-      count: 0,
-      updated: 0,
-      inserted: 0,
-    };
+    console.error("❌ Sheet upsert failed:", e?.message || e);
+    lastRun = { ok: false, error: e?.message || "unknown", updated_at: null, total_incoming: 0, updated: 0, inserted: 0 };
   }
 });
 
-// Start server
+// Start
 app.listen(PORT, () => {
-  console.log(`tgju-to-sheets running on http://localhost:${PORT}`);
+  console.log(`tgju-to-sheets listening on :${PORT}`);
   console.log(`Manual run: /run?force=1`);
 });
