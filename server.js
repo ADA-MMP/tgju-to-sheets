@@ -1,25 +1,22 @@
 /**
- * service.js — TGJU → Google Sheets (ESM, Option A, Render-friendly)
+ * service.js — TGJU → Google Sheets (Render-ready, ESM)
  *
- * Fixes your error:
- *   "doc.useServiceAccountAuth is not a function"
- * by using google-auth-library JWT and passing it into GoogleSpreadsheet(...)
+ * Fixes:
+ * - Uses google-auth-library JWT (so NO doc.useServiceAccountAuth error)
+ * - Always ensures header row exists (so NO "Header values are not yet loaded")
  *
- * Key requirement:
- *   Keep rows “fixed” by (group + code):
- *   - If a row with same group+code exists -> UPDATE it in place
- *   - If not -> ADD a new row
+ * ENV required (Render → Environment Variables):
+ *   SHEET_ID
+ *   GOOGLE_SERVICE_ACCOUNT_JSON_BASE64
+ * Optional:
+ *   PORT
+ *   WORKSHEET_TITLE
+ *   CACHE_TTL_MS
+ *   ONLY_MAJOR   ("1" or "0")
  *
- * ENV (Render > Environment Variables):
- *   SHEET_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
- *   WORKSHEET_TITLE=Rates
- *   GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=base64(JSON)
- *   ONLY_MAJOR=0|1
- *   CACHE_TTL_MS=60000
- *   PORT=3000  (Render sets PORT automatically; you can omit)
- *
- * NPM deps needed:
- *   express, dotenv, node-cron, google-spreadsheet, google-auth-library
+ * Routes:
+ *   GET /health
+ *   GET /run?force=1
  */
 
 import "dotenv/config";
@@ -41,7 +38,7 @@ const ONLY_MAJOR = String(process.env.ONLY_MAJOR || "0") === "1";
 const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 || "";
 
 // -----------------------------
-// Major fiat only (optional)
+// Config: major fiat list only
 // -----------------------------
 const MAJOR_FIAT = new Set([
   "usd", "eur", "gbp", "cad", "aed", "try",
@@ -52,7 +49,7 @@ const MAJOR_FIAT = new Set([
   "php", "mxn", "brl", "zar",
 ]);
 
-// TGJU special keys -> normalized codes
+// TGJU special fiat keys -> normalized codes
 const SPECIAL_CODE_MAP = {
   dollar_rl: "usd",
   dollar_ex: "usd_official",
@@ -61,7 +58,7 @@ const SPECIAL_CODE_MAP = {
   eur_ex: "eur_official",
 };
 
-// Persian names (extend anytime)
+// Persian names (expand any time)
 const FA_NAME_MAP = {
   usd: "دلار آمریکا",
   eur: "یورو",
@@ -152,8 +149,8 @@ const CRYPTO_KEYWORDS = [
 ];
 
 const GOLD_KEYWORDS = [
-  "gold","silver","xau","sekke","sekee","sekeb","rob","nim","gerami",
-  "emami","bahar","mesghal","ons","coin","tala","sime","abshode",
+  "gold","silver","xau","sekke","rob","nim","gerami","emami","bahar",
+  "mesghal","ons","coin","tala","sime","abshode",
 ];
 
 function isGoldKey(key) {
@@ -163,7 +160,6 @@ function isGoldKey(key) {
 
 function isCryptoKey(key) {
   const k = key.toLowerCase();
-
   if (k.endsWith("-irr") || k.endsWith("_irr")) {
     return CRYPTO_KEYWORDS.some((c) => k.startsWith(c));
   }
@@ -184,9 +180,7 @@ function isFiatKey(key) {
   return true;
 }
 
-// -----------------------------
-// Normalize TGJU entry -> sheet row
-// -----------------------------
+// Normalize TGJU entry -> row object (name/label NEVER numeric)
 function normalizeEntry(priceKey, item, group) {
   const code = tgjuKeyToCode(priceKey);
   const base = baseCurrency(code);
@@ -211,7 +205,6 @@ function normalizeEntry(priceKey, item, group) {
     safeString(item?.s) ||
     "";
 
-  // NEVER allow numeric “name/label”
   const safeRawName = isNumericLike(rawName) ? "" : rawName.trim();
   const safeRawLabel = isNumericLike(rawLabel) ? "" : rawLabel.trim();
 
@@ -231,7 +224,7 @@ function normalizeEntry(priceKey, item, group) {
 }
 
 // -----------------------------
-// Google auth + sheet helpers
+// Google Sheets auth + write
 // -----------------------------
 function loadServiceAccountFromEnv() {
   if (!SA_B64) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 in env");
@@ -256,18 +249,22 @@ function loadServiceAccountFromEnv() {
   return creds;
 }
 
-async function getWorksheet() {
-  if (!SHEET_ID) throw new Error("Missing SHEET_ID in env");
-
-  const creds = loadServiceAccountFromEnv();
-  const jwt = new JWT({
+function makeJwtAuth(creds) {
+  return new JWT({
     email: creds.client_email,
     key: String(creds.private_key).replace(/\\n/g, "\n"),
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
+}
 
-  // ✅ v4+ uses auth in constructor
-  const doc = new GoogleSpreadsheet(SHEET_ID, jwt);
+async function getSheet() {
+  if (!SHEET_ID) throw new Error("Missing SHEET_ID in env");
+
+  const creds = loadServiceAccountFromEnv();
+  const auth = makeJwtAuth(creds);
+
+  // v4+ supports passing auth in constructor
+  const doc = new GoogleSpreadsheet(SHEET_ID, auth);
 
   await doc.loadInfo();
 
@@ -277,106 +274,58 @@ async function getWorksheet() {
   return sheet;
 }
 
-async function ensureHeaders(sheet) {
-  const wanted = ["group","code","name_fa","price","change","low","high","ts","updated_at"];
-
-  // Important: load header row first (fixes "Header values are not yet loaded")
+async function ensureHeaders(sheet, wantedHeaders) {
+  // Try load; may fail if not set yet
   try {
     await sheet.loadHeaderRow();
   } catch {
-    // If sheet is brand-new, loadHeaderRow may fail; ignore.
+    // ignore
   }
 
-  const current = Array.isArray(sheet.headerValues) ? sheet.headerValues : [];
+  const hasHeaders =
+    Array.isArray(sheet.headerValues) && sheet.headerValues.length > 0;
 
-  if (!current.length) {
-    await sheet.setHeaderRow(wanted);
-    return wanted;
+  if (!hasHeaders) {
+    await sheet.setHeaderRow(wantedHeaders);
+    await sheet.loadHeaderRow(); // IMPORTANT: now headerValues exists
   }
-
-  // If headers differ, set to wanted (optional but safer)
-  const same =
-    current.length === wanted.length &&
-    current.every((h, i) => String(h) === String(wanted[i]));
-
-  if (!same) {
-    await sheet.setHeaderRow(wanted);
-    return wanted;
-  }
-
-  return current;
 }
 
-/**
- * Upsert by group+code:
- * - Update existing row in place
- * - Add new row if not found
- * (Does NOT delete rows that disappeared from TGJU.)
- */
-async function upsertRows(sheet, incomingRows) {
-  await ensureHeaders(sheet);
+async function writeRowsToSheet(rows) {
+  const sheet = await getSheet();
 
-  const existing = await sheet.getRows(); // reads all rows
-  const byKey = new Map();
+  const wantedHeaders = [
+    "group",
+    "code",
+    "name_fa",
+    "price",
+    "change",
+    "low",
+    "high",
+    "ts",
+    "updated_at",
+  ];
 
-  for (const r of existing) {
-    const g = String(r.get("group") ?? "").trim().toLowerCase();
-    const c = String(r.get("code") ?? "").trim().toLowerCase();
-    if (!g || !c) continue;
-    byKey.set(`${g}|${c}`, r);
-  }
+  await ensureHeaders(sheet, wantedHeaders);
+
+  // Clear old rows
+  const existing = await sheet.getRows();
+  for (const r of existing) await r.delete();
 
   const updated_at = new Date().toISOString();
-  let updated = 0;
-  const toInsert = [];
+  const finalRows = rows.map((r) => ({ ...r, updated_at }));
 
-  for (const row of incomingRows) {
-    const g = String(row.group).toLowerCase();
-    const c = String(row.code).toLowerCase();
-    const key = `${g}|${c}`;
-
-    const found = byKey.get(key);
-    if (found) {
-      // update in place
-      found.set("name_fa", row.name_fa);
-      found.set("price", row.price);
-      found.set("change", row.change);
-      found.set("low", row.low);
-      found.set("high", row.high);
-      found.set("ts", row.ts);
-      found.set("updated_at", updated_at);
-
-      await found.save();
-      updated++;
-    } else {
-      // insert new
-      toInsert.push({
-        ...row,
-        updated_at,
-      });
-    }
+  if (finalRows.length) {
+    await sheet.addRows(finalRows);
   }
 
-  let inserted = 0;
-  if (toInsert.length) {
-    await sheet.addRows(toInsert);
-    inserted = toInsert.length;
-  }
-
-  return { updated, inserted, updated_at, total_incoming: incomingRows.length };
+  return { count: finalRows.length, updated_at };
 }
 
 // -----------------------------
-// Fetch TGJU -> build incoming rows
+// Fetch + build rows (with cache)
 // -----------------------------
-let lastRun = {
-  ok: false,
-  error: "Not run yet",
-  updated_at: null,
-  total_incoming: 0,
-  updated: 0,
-  inserted: 0,
-};
+let lastRun = { ok: false, error: "Not run yet", updated_at: null, count: 0 };
 let lastFetchMs = 0;
 
 async function fetchAndWrite(force = false) {
@@ -392,6 +341,7 @@ async function fetchAndWrite(force = false) {
   });
 
   const text = await res.text();
+
   let json;
   try {
     json = JSON.parse(text);
@@ -424,18 +374,16 @@ async function fetchAndWrite(force = false) {
       const entry = normalizeEntry(key, item, "fiat");
       if (ONLY_MAJOR && !MAJOR_FIAT.has(baseCurrency(entry.code))) continue;
       rows.push(entry);
+      continue;
     }
   }
 
-  // Stable sort (doesn’t affect row “fixedness”; key is group+code)
-  rows.sort((a, b) => (a.group + "|" + a.code).localeCompare(b.group + "|" + b.code));
+  rows.sort((a, b) => (a.group + a.code).localeCompare(b.group + b.code));
 
-  const sheet = await getWorksheet();
-  const result = await upsertRows(sheet, rows);
+  const result = await writeRowsToSheet(rows);
 
-  lastRun = { ok: true, error: null, ...result };
+  lastRun = { ok: true, error: null, updated_at: result.updated_at, count: result.count };
   lastFetchMs = nowMs();
-
   return lastRun;
 }
 
@@ -452,7 +400,6 @@ app.get("/health", (_req, res) => {
     service: "tgju-to-sheets",
     worksheet: WORKSHEET_TITLE,
     only_major: ONLY_MAJOR,
-    cache_ttl_ms: CACHE_TTL_MS,
     lastRun,
   });
 });
@@ -463,7 +410,6 @@ app.get("/run", async (req, res) => {
     const out = await fetchAndWrite(force);
     res.json({ ok: true, ...out });
   } catch (e) {
-    lastRun = { ok: false, error: e?.message || "unknown", updated_at: null, total_incoming: 0, updated: 0, inserted: 0 };
     res.status(500).json({ ok: false, error: e?.message || "unknown" });
   }
 });
@@ -474,15 +420,17 @@ app.get("/run", async (req, res) => {
 cron.schedule("*/5 * * * *", async () => {
   try {
     await fetchAndWrite(false);
-    console.log("✅ Sheet upsert OK:", lastRun);
+    console.log("✅ Sheet updated:", lastRun);
   } catch (e) {
-    console.error("❌ Sheet upsert failed:", e?.message || e);
-    lastRun = { ok: false, error: e?.message || "unknown", updated_at: null, total_incoming: 0, updated: 0, inserted: 0 };
+    console.error("❌ Update failed:", e?.message || e);
+    lastRun = { ok: false, error: e?.message || "unknown", updated_at: null, count: 0 };
   }
 });
 
-// Start
+// -----------------------------
+// Start server
+// -----------------------------
 app.listen(PORT, () => {
-  console.log(`tgju-to-sheets listening on :${PORT}`);
+  console.log(`tgju-to-sheets running on port ${PORT}`);
   console.log(`Manual run: /run?force=1`);
 });
